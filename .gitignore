@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+# Python environments
+.venv/
+venv/
+
+# Generated analysis artifacts (keep repo clean)
+outputs_body/
+outputs/
+models/
+
