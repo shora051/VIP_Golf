@@ -109,6 +109,222 @@ def elbow_angle_2d_abs_deg(
     return float(np.degrees(np.arccos(cos_theta)))
 
 
+def ema_smooth_nan(x: np.ndarray, alpha: float) -> np.ndarray:
+    """
+    EMA smoothing for signals containing NaNs.
+
+    We fill NaNs using forward-fill then back-fill so event detection has
+    a continuous curve. This is intended for heuristics (not perfect signal
+    reconstruction).
+    """
+    if alpha <= 0.0:
+        return x
+
+    x = np.asarray(x, dtype=np.float64)
+    n = x.shape[0]
+    valid = ~np.isnan(x)
+    if not np.any(valid):
+        return x
+
+    # Forward fill
+    x_filled = x.copy()
+    last = np.nan
+    for i in range(n):
+        if not np.isnan(x_filled[i]):
+            last = x_filled[i]
+        else:
+            x_filled[i] = last
+
+    # Back fill (leading NaNs)
+    first_valid = int(np.argmax(valid))
+    if first_valid > 0:
+        x_filled[:first_valid] = x_filled[first_valid]
+
+    # EMA
+    ema = np.empty(n, dtype=np.float64)
+    ema_prev = x_filled[0]
+    ema[0] = ema_prev
+    for i in range(1, n):
+        ema_prev = alpha * x_filled[i] + (1.0 - alpha) * ema_prev
+        ema[i] = ema_prev
+    return ema
+
+
+@dataclass
+class SwingPhaseInterval:
+    phase: str
+    start_frame: int
+    start_timestamp_sec: float
+    end_frame: int
+
+
+def detect_swing_phases(
+    xfactor_proxy_deg: np.ndarray,
+    timestamps_sec: np.ndarray,
+    fps: float,
+    visibility_mask: np.ndarray,
+    ema_alpha: float = 0.25,
+    abs_threshold_ratio: float = 0.15,
+    impact_abs_threshold_ratio: float = 0.12,
+    finish_abs_threshold_ratio: float = 0.07,
+    # Avoid finishing immediately on the impact frame in clips where
+    # |xfactor| already happens to be small at the detected impact moment.
+    # This mainly improves phase "duration" stability across clips.
+    min_post_impact_frames: int = 6,
+    end_abs_threshold_ratio: float = 0.05,
+    settle_frames: int = 6,
+    pre_takeaway_frames: int = 12,
+) -> List[SwingPhaseInterval]:
+    """
+    Heuristic swing-phase segmentation based on X-factor magnitude and sign.
+
+    Works for both left/right handed swings by using |xfactor| for peak/top
+    and sign change / abs-minimum for impact.
+    """
+    n = int(xfactor_proxy_deg.shape[0])
+    if n < 10:
+        return []
+
+    if np.mean(visibility_mask.astype(np.float64)) < 0.3:
+        # Too many missing frames; heuristics will be unreliable.
+        return []
+
+    x = np.asarray(xfactor_proxy_deg, dtype=np.float64)
+    x_s = ema_smooth_nan(x, ema_alpha)
+    abs_x = np.abs(x_s)
+
+    abs_max = float(np.nanmax(abs_x))
+    if not np.isfinite(abs_max) or abs_max < 5.0:
+        return []
+
+    abs_threshold = max(float(abs_threshold_ratio * abs_max), 3.0)
+    dx_abs = np.diff(abs_x, prepend=abs_x[0])
+
+    # Takeaway start: first time abs(x) rises above threshold.
+    takeaway_start = None
+    for i in range(1, n):
+        if abs_x[i] >= abs_threshold and dx_abs[i] > 0:
+            takeaway_start = i
+            break
+    if takeaway_start is None:
+        takeaway_start = 0
+
+    # Impact detection first:
+    # 1) Prefer the first sign change after takeaway while abs(x) is near baseline.
+    # 2) Otherwise, use earliest abs-minimum around the baseline region.
+    impact_abs_threshold = float(impact_abs_threshold_ratio * abs_max)
+    min_impact_search_frames = 6
+
+    impact_idx = None
+    for i in range(takeaway_start + min_impact_search_frames, n):
+        if x_s[i - 1] == 0.0:
+            if abs_x[i - 1] <= impact_abs_threshold:
+                impact_idx = i - 1
+                break
+        if x_s[i - 1] * x_s[i] < 0.0 and abs_x[i] <= impact_abs_threshold:
+            impact_idx = i
+            break
+
+    if impact_idx is None:
+        candidates = np.where((abs_x <= impact_abs_threshold) & (np.arange(n) >= takeaway_start))[0]
+        if candidates.size > 0:
+            impact_idx = int(candidates[0])
+        else:
+            impact_idx = int(takeaway_start + int(np.argmin(abs_x[takeaway_start:])))
+
+    # Refine impact to local min abs around the crossing/baseline moment.
+    lo = max(0, impact_idx - 10)
+    hi = min(n, impact_idx + 11)
+    impact_idx = int(lo + int(np.argmin(abs_x[lo:hi])))
+
+    # Top: max |x| in the pre-impact window.
+    # This prevents later finish noise from becoming the "top".
+    if impact_idx <= takeaway_start + 1:
+        top_idx = takeaway_start
+    else:
+        top_idx = int(takeaway_start + int(np.argmax(abs_x[takeaway_start : impact_idx + 1])))
+
+    # Finish start: first time abs(x) stays small for a few frames.
+    finish_start = None
+    finish_abs_threshold = float(finish_abs_threshold_ratio * abs_max)
+    search_start = int(max(0, impact_idx + min_post_impact_frames))
+    for i in range(search_start, max(0, n - settle_frames)):
+        if (
+            np.all(abs_x[i : i + settle_frames] <= finish_abs_threshold)
+        ):
+            finish_start = i
+            break
+    if finish_start is None:
+        finish_start = impact_idx
+
+    # End: last time abs(x) is meaningfully non-zero.
+    end_abs_threshold = float(end_abs_threshold_ratio * abs_max)
+    nz = np.where(abs_x >= end_abs_threshold)[0]
+    end_idx = int(nz[-1]) if nz.size > 0 else n - 1
+
+    address_start = max(0, takeaway_start - pre_takeaway_frames)
+    address_end = max(address_start, takeaway_start - 1)
+
+    takeaway_end = max(top_idx, takeaway_start)
+    top_start = top_idx
+    top_end = max(impact_idx, top_start)
+
+    impact_start = impact_idx
+    impact_end = max(finish_start - 1, impact_start)
+    finish_start = max(finish_start, impact_start)
+    finish_end = max(end_idx, finish_start)
+
+    def clamp_interval(a: int, b: int) -> Tuple[int, int]:
+        a = int(max(0, min(n - 1, a)))
+        b = int(max(0, min(n - 1, b)))
+        if b < a:
+            b = a
+        return a, b
+
+    address_start, address_end = clamp_interval(address_start, address_end)
+    takeaway_start_i, takeaway_end = clamp_interval(takeaway_start, takeaway_end)
+    top_start, top_end = clamp_interval(top_start, top_end)
+    impact_start, impact_end = clamp_interval(impact_start, impact_end)
+    finish_start, finish_end = clamp_interval(finish_start, finish_end)
+
+    # Ensure timestamps are consistent even if fps is slightly off.
+    def ts_at(i: int) -> float:
+        return float(timestamps_sec[i]) if timestamps_sec.size > i else (i / fps)
+
+    return [
+        SwingPhaseInterval(
+            phase="address",
+            start_frame=address_start,
+            start_timestamp_sec=ts_at(address_start),
+            end_frame=address_end,
+        ),
+        SwingPhaseInterval(
+            phase="takeaway",
+            start_frame=takeaway_start_i,
+            start_timestamp_sec=ts_at(takeaway_start_i),
+            end_frame=takeaway_end,
+        ),
+        SwingPhaseInterval(
+            phase="top",
+            start_frame=top_start,
+            start_timestamp_sec=ts_at(top_start),
+            end_frame=top_end,
+        ),
+        SwingPhaseInterval(
+            phase="impact",
+            start_frame=impact_start,
+            start_timestamp_sec=ts_at(impact_start),
+            end_frame=impact_end,
+        ),
+        SwingPhaseInterval(
+            phase="finish",
+            start_frame=finish_start,
+            start_timestamp_sec=ts_at(finish_start),
+            end_frame=finish_end,
+        ),
+    ]
+
+
 def landmark_to_node2d(lm, w: int, h: int) -> Node2D:
     # MediaPipe pose landmark coordinates are normalized to [0..1] for x,y relative to image size.
     return Node2D(
@@ -258,6 +474,13 @@ def main():
     ap.add_argument("--input", required=True, help="Path to .mp4 or .mov input video")
     ap.add_argument("--output_dir", required=True, help="Folder to write CSV and debug video")
     ap.add_argument("--visibility_threshold", type=float, default=0.5, help="Min landmark visibility to accept")
+    ap.add_argument("--ema_alpha", type=float, default=0.25, help="EMA alpha for event detection angles (0 disables)")
+    ap.add_argument(
+        "--min_post_impact_frames",
+        type=int,
+        default=6,
+        help="Minimum frames after impact before considering 'finish' start",
+    )
     ap.add_argument(
         "--model_path",
         default="",
@@ -290,6 +513,7 @@ def main():
     csv_path = os.path.join(output_dir, "body_landmarks_timeseries.csv")
     debug_video_path = os.path.join(output_dir, "debug_body_landmarks.mp4")
     angles_csv_path = os.path.join(output_dir, "body_angles_timeseries.csv")
+    swing_events_csv_path = os.path.join(output_dir, "swing_events.csv")
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -350,6 +574,9 @@ def main():
         )
 
         frame_index = 0
+        xfactor_series: List[float] = []
+        timestamps_series: List[float] = []
+        xfactor_valid_mask: List[bool] = []
         while True:
             ok, frame_bgr = cap.read()
             if not ok:
@@ -488,6 +715,15 @@ def main():
                 ]
             )
 
+            # Store for swing-phase event detection (heuristic).
+            timestamps_series.append(float(timestamp_sec))
+            if xfactor_proxy_deg is None:
+                xfactor_series.append(float("nan"))
+                xfactor_valid_mask.append(False)
+            else:
+                xfactor_series.append(float(xfactor_proxy_deg))
+                xfactor_valid_mask.append(bool(lines_valid))
+
             # Debug overlay video
             draw_debug(
                 frame_bgr,
@@ -510,9 +746,34 @@ def main():
     writer.release()
     landmarker.close()
 
+    # Swing event detection (body-based heuristic).
+    xfactor_arr = np.asarray(xfactor_series, dtype=np.float64)
+    timestamps_arr = np.asarray(timestamps_series, dtype=np.float64)
+    visibility_mask_arr = np.asarray(xfactor_valid_mask, dtype=bool)
+
+    events = detect_swing_phases(
+        xfactor_proxy_deg=xfactor_arr,
+        timestamps_sec=timestamps_arr,
+        fps=fps,
+        visibility_mask=visibility_mask_arr,
+        ema_alpha=float(args.ema_alpha),
+        min_post_impact_frames=int(args.min_post_impact_frames),
+    )
+    with open(swing_events_csv_path, "w", newline="", encoding="utf-8") as f_events:
+        w = csv.writer(f_events)
+        w.writerow(["phase", "start_frame", "start_timestamp", "end_frame"])
+        if not events:
+            print("Swing event detection: insufficient signal; wrote empty events CSV.")
+        else:
+            for ev in events:
+                w.writerow(
+                    [ev.phase, ev.start_frame, f"{ev.start_timestamp_sec:.6f}", ev.end_frame]
+                )
+
     print(f"Wrote CSV: {csv_path}")
     print(f"Wrote CSV: {angles_csv_path}")
     print(f"Wrote debug video: {debug_video_path}")
+    print(f"Wrote swing events CSV: {swing_events_csv_path}")
 
 
 if __name__ == "__main__":
