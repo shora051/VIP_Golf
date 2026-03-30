@@ -8,5 +8,9 @@ venv/
 # Generated analysis artifacts (keep repo clean)
 outputs_body/
 outputs/
+out/
+**/out/
+out_*/
+**/out_*/
 models/
 
