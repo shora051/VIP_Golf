@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import cv2
-import mediapipe as mp
 import numpy as np
 
 
@@ -200,67 +199,78 @@ def detect_swing_phases(
     abs_threshold = max(float(abs_threshold_ratio * abs_max), 3.0)
     dx_abs = np.diff(abs_x, prepend=abs_x[0])
 
-    # Takeaway start: first time abs(x) rises above threshold.
-    takeaway_start = None
-    for i in range(1, n):
-        if abs_x[i] >= abs_threshold and dx_abs[i] > 0:
-            takeaway_start = i
-            break
-    if takeaway_start is None:
-        takeaway_start = 0
+    def find_takeaway_start() -> int:
+        # Takeaway start: first time abs(x) rises above threshold.
+        for i in range(1, n):
+            if abs_x[i] >= abs_threshold and dx_abs[i] > 0:
+                return i
+        return 0
 
-    # Impact detection first:
-    # 1) Prefer the first sign change after takeaway while abs(x) is near baseline.
-    # 2) Otherwise, use earliest abs-minimum around the baseline region.
-    impact_abs_threshold = float(impact_abs_threshold_ratio * abs_max)
-    min_impact_search_frames = 6
+    def refine_impact_idx(impact_idx: int) -> int:
+        # Refine impact to local min abs around the crossing/baseline moment.
+        lo = max(0, impact_idx - 10)
+        hi = min(n, impact_idx + 11)
+        return int(lo + int(np.argmin(abs_x[lo:hi])))
 
-    impact_idx = None
-    for i in range(takeaway_start + min_impact_search_frames, n):
-        if x_s[i - 1] == 0.0:
-            if abs_x[i - 1] <= impact_abs_threshold:
-                impact_idx = i - 1
+    def find_impact_idx(takeaway_start: int) -> int:
+        # Impact detection first:
+        # 1) Prefer the first sign change after takeaway while abs(x) is near baseline.
+        # 2) Otherwise, use earliest abs-minimum around the baseline region.
+        impact_abs_threshold = float(impact_abs_threshold_ratio * abs_max)
+        min_impact_search_frames = 6
+
+        impact_idx: Optional[int] = None
+        for i in range(takeaway_start + min_impact_search_frames, n):
+            if x_s[i - 1] == 0.0:
+                if abs_x[i - 1] <= impact_abs_threshold:
+                    impact_idx = i - 1
+                    break
+            if x_s[i - 1] * x_s[i] < 0.0 and abs_x[i] <= impact_abs_threshold:
+                impact_idx = i
                 break
-        if x_s[i - 1] * x_s[i] < 0.0 and abs_x[i] <= impact_abs_threshold:
-            impact_idx = i
-            break
 
-    if impact_idx is None:
-        candidates = np.where((abs_x <= impact_abs_threshold) & (np.arange(n) >= takeaway_start))[0]
-        if candidates.size > 0:
-            impact_idx = int(candidates[0])
-        else:
-            impact_idx = int(takeaway_start + int(np.argmin(abs_x[takeaway_start:])))
+        if impact_idx is None:
+            candidates = np.where(
+                (abs_x <= impact_abs_threshold) & (np.arange(n) >= takeaway_start)
+            )[0]
+            if candidates.size > 0:
+                impact_idx = int(candidates[0])
+            else:
+                impact_idx = int(takeaway_start + int(np.argmin(abs_x[takeaway_start:])))
 
-    # Refine impact to local min abs around the crossing/baseline moment.
-    lo = max(0, impact_idx - 10)
-    hi = min(n, impact_idx + 11)
-    impact_idx = int(lo + int(np.argmin(abs_x[lo:hi])))
+        return refine_impact_idx(impact_idx)
 
-    # Top: max |x| in the pre-impact window.
-    # This prevents later finish noise from becoming the "top".
-    if impact_idx <= takeaway_start + 1:
-        top_idx = takeaway_start
-    else:
-        top_idx = int(takeaway_start + int(np.argmax(abs_x[takeaway_start : impact_idx + 1])))
+    def find_top_idx(takeaway_start: int, impact_idx: int) -> int:
+        # Top: max |x| in the pre-impact window.
+        # This prevents later finish noise from becoming the "top".
+        if impact_idx <= takeaway_start + 1:
+            return takeaway_start
+        return int(takeaway_start + int(np.argmax(abs_x[takeaway_start : impact_idx + 1])))
 
-    # Finish start: first time abs(x) stays small for a few frames.
-    finish_start = None
+    def find_finish_start(impact_idx: int, finish_abs_threshold: float) -> int:
+        # Finish start: first time abs(x) stays small for a few frames.
+        finish_start: Optional[int] = None
+        search_start = int(max(0, impact_idx + min_post_impact_frames))
+        for i in range(search_start, max(0, n - settle_frames)):
+            if np.all(abs_x[i : i + settle_frames] <= finish_abs_threshold):
+                finish_start = i
+                break
+        return impact_idx if finish_start is None else finish_start
+
+    def find_end_idx(end_abs_threshold: float) -> int:
+        # End: last time abs(x) is meaningfully non-zero.
+        nz = np.where(abs_x >= end_abs_threshold)[0]
+        return int(nz[-1]) if nz.size > 0 else n - 1
+
+    takeaway_start = find_takeaway_start()
+    impact_idx = find_impact_idx(takeaway_start)
+    top_idx = find_top_idx(takeaway_start, impact_idx)
+
     finish_abs_threshold = float(finish_abs_threshold_ratio * abs_max)
-    search_start = int(max(0, impact_idx + min_post_impact_frames))
-    for i in range(search_start, max(0, n - settle_frames)):
-        if (
-            np.all(abs_x[i : i + settle_frames] <= finish_abs_threshold)
-        ):
-            finish_start = i
-            break
-    if finish_start is None:
-        finish_start = impact_idx
+    finish_start = find_finish_start(impact_idx, finish_abs_threshold)
 
-    # End: last time abs(x) is meaningfully non-zero.
     end_abs_threshold = float(end_abs_threshold_ratio * abs_max)
-    nz = np.where(abs_x >= end_abs_threshold)[0]
-    end_idx = int(nz[-1]) if nz.size > 0 else n - 1
+    end_idx = find_end_idx(end_abs_threshold)
 
     address_start = max(0, takeaway_start - pre_takeaway_frames)
     address_end = max(address_start, takeaway_start - 1)
