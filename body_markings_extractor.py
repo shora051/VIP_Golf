@@ -149,12 +149,164 @@ def ema_smooth_nan(x: np.ndarray, alpha: float) -> np.ndarray:
     return ema
 
 
+def hand_plane_angle_2d_abs_deg(
+    shoulder_mid: Tuple[float, float],
+    wrist_mid: Tuple[float, float],
+) -> float:
+    """Angle (0..180) of shoulder→wrist vs vertical; same convention as spine_angle_2d_abs_deg."""
+    return spine_angle_2d_abs_deg(shoulder_mid, wrist_mid)
+
+
+def pixel_velocity_from_positions(
+    x: np.ndarray, y: np.ndarray, fps: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Per-frame velocity in px/s from finite differences. Frame 0 is NaN.
+    speed = hypot(vx, vy).
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    n = x.shape[0]
+    vx = np.full(n, np.nan, dtype=np.float64)
+    vy = np.full(n, np.nan, dtype=np.float64)
+    if n < 2:
+        return vx, vy, np.full(n, np.nan, dtype=np.float64)
+    for i in range(1, n):
+        if not np.isnan(x[i]) and not np.isnan(x[i - 1]) and not np.isnan(y[i]) and not np.isnan(y[i - 1]):
+            vx[i] = float((x[i] - x[i - 1]) * fps)
+            vy[i] = float((y[i] - y[i - 1]) * fps)
+    speed = np.hypot(vx, vy)
+    return vx, vy, speed
+
+
 @dataclass
 class SwingPhaseInterval:
     phase: str
     start_frame: int
     start_timestamp_sec: float
     end_frame: int
+
+
+def events_by_phase(events: List[SwingPhaseInterval]) -> Dict[str, SwingPhaseInterval]:
+    return {ev.phase: ev for ev in events}
+
+
+def frame_range_inclusive(ev: SwingPhaseInterval) -> range:
+    return range(int(ev.start_frame), int(ev.end_frame) + 1)
+
+
+def nanmean_on_frames(values: np.ndarray, frames: range) -> float:
+    vals = [values[i] for i in frames if 0 <= i < values.shape[0]]
+    arr = np.asarray(vals, dtype=np.float64)
+    arr = arr[~np.isnan(arr)]
+    if arr.size == 0:
+        return float("nan")
+    return float(np.mean(arr))
+
+
+def nanmax_on_frames(values: np.ndarray, frames: range) -> float:
+    vals = [values[i] for i in frames if 0 <= i < values.shape[0]]
+    arr = np.asarray(vals, dtype=np.float64)
+    arr = arr[~np.isnan(arr)]
+    if arr.size == 0:
+        return float("nan")
+    return float(np.max(arr))
+
+
+def compute_swing_features(
+    mid_wrist_x: np.ndarray,
+    mid_wrist_y: np.ndarray,
+    hand_plane_deg: np.ndarray,
+    fps: float,
+    ema_alpha: float,
+    events: List[SwingPhaseInterval],
+    frame_count: int,
+) -> Dict[str, float]:
+    """
+    One-row summary features for training (image-plane proxies, not real-world club metrics).
+    """
+    out: Dict[str, float] = {
+        "frame_count": float(frame_count),
+        "wrist_speed_proxy_peak_impact_px_s": float("nan"),
+        "wrist_speed_proxy_mean_impact_px_s": float("nan"),
+        "wrist_lateral_displacement_address_to_impact_px": float("nan"),
+        "wrist_lateral_mean_vx_impact_px_s": float("nan"),
+        "hand_plane_angle_mean_address_deg": float("nan"),
+        "hand_plane_angle_mean_top_deg": float("nan"),
+        "hand_plane_angle_mean_impact_deg": float("nan"),
+        "duration_takeaway_sec": float("nan"),
+        "duration_top_sec": float("nan"),
+        "duration_top_to_impact_sec": float("nan"),
+        "duration_impact_sec": float("nan"),
+        "backswing_to_downswing_ratio": float("nan"),
+    }
+    if frame_count < 1:
+        return out
+
+    vx, vy, speed = pixel_velocity_from_positions(mid_wrist_x, mid_wrist_y, fps)
+    vx_s = ema_smooth_nan(vx, ema_alpha)
+    vy_s = ema_smooth_nan(vy, ema_alpha)
+    speed_s = ema_smooth_nan(speed, ema_alpha)
+
+    if not events:
+        return out
+
+    by = events_by_phase(events)
+    required = ("address", "takeaway", "top", "impact", "finish")
+    if not all(p in by for p in required):
+        return out
+
+    addr = by["address"]
+    tw = by["takeaway"]
+    top = by["top"]
+    imp = by["impact"]
+
+    # Tempo: phase lengths and top→impact (downswing proxy)
+    out["duration_takeaway_sec"] = float((tw.end_frame - tw.start_frame) / fps) if fps > 0 else float("nan")
+    out["duration_top_sec"] = float((top.end_frame - top.start_frame) / fps) if fps > 0 else float("nan")
+    out["duration_top_to_impact_sec"] = float((imp.start_frame - top.start_frame) / fps) if fps > 0 else float("nan")
+    out["duration_impact_sec"] = float((imp.end_frame - imp.start_frame) / fps) if fps > 0 else float("nan")
+    num_back = float(top.start_frame - tw.start_frame)
+    num_down = float(imp.start_frame - top.start_frame)
+    if num_down > 1e-6:
+        out["backswing_to_downswing_ratio"] = float(num_back / num_down)
+
+    # Hand-plane means per phase (address, top, impact)
+    for phase_name, key in (
+        ("address", "hand_plane_angle_mean_address_deg"),
+        ("top", "hand_plane_angle_mean_top_deg"),
+        ("impact", "hand_plane_angle_mean_impact_deg"),
+    ):
+        ev = by[phase_name]
+        m = nanmean_on_frames(hand_plane_deg, frame_range_inclusive(ev))
+        out[key] = m
+
+    # Wrist speed in impact phase (smoothed)
+    imp_range = frame_range_inclusive(imp)
+    out["wrist_speed_proxy_peak_impact_px_s"] = nanmax_on_frames(speed_s, imp_range)
+    vals_sp = [
+        speed_s[i]
+        for i in imp_range
+        if 0 <= i < speed_s.shape[0] and not np.isnan(speed_s[i])
+    ]
+    if vals_sp:
+        out["wrist_speed_proxy_mean_impact_px_s"] = float(np.mean(vals_sp))
+
+    # Lateral: displacement mean(impact x) - mean(address x); mean smoothed vx in impact
+    mx_addr = nanmean_on_frames(mid_wrist_x, frame_range_inclusive(addr))
+    mx_imp = nanmean_on_frames(mid_wrist_x, imp_range)
+    if not np.isnan(mx_addr) and not np.isnan(mx_imp):
+        out["wrist_lateral_displacement_address_to_impact_px"] = float(mx_imp - mx_addr)
+
+    vals_vx = [
+        vx_s[i]
+        for i in imp_range
+        if 0 <= i < vx_s.shape[0] and not np.isnan(vx_s[i])
+    ]
+    if vals_vx:
+        out["wrist_lateral_mean_vx_impact_px_s"] = float(np.mean(vals_vx))
+
+    return out
 
 
 def detect_swing_phases(
@@ -497,6 +649,11 @@ def main():
         help="Optional path to pose landmarker model (.task). If not provided, model will be auto-downloaded.",
     )
     ap.add_argument("--max_frames", type=int, default=-1, help="Optional limit for debugging")
+    ap.add_argument(
+        "--no_swing_features",
+        action="store_true",
+        help="Skip writing swing_features.csv (summary row for training)",
+    )
     args = ap.parse_args()
 
     input_path = args.input
@@ -524,6 +681,7 @@ def main():
     debug_video_path = os.path.join(output_dir, "debug_body_landmarks.mp4")
     angles_csv_path = os.path.join(output_dir, "body_angles_timeseries.csv")
     swing_events_csv_path = os.path.join(output_dir, "swing_events.csv")
+    swing_features_csv_path = os.path.join(output_dir, "swing_features.csv")
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -587,6 +745,9 @@ def main():
         xfactor_series: List[float] = []
         timestamps_series: List[float] = []
         xfactor_valid_mask: List[bool] = []
+        mid_wrist_x_series: List[float] = []
+        mid_wrist_y_series: List[float] = []
+        hand_plane_deg_series: List[float] = []
         while True:
             ok, frame_bgr = cap.read()
             if not ok:
@@ -711,6 +872,37 @@ def main():
                 ):
                     arms_valid = True
 
+                # Mid-wrist and hand-plane proxy (image plane) for swing_features.csv
+                mw_x = float("nan")
+                mw_y = float("nan")
+                hp_deg = float("nan")
+                if (
+                    nodes[11].visibility >= args.visibility_threshold
+                    and nodes[12].visibility >= args.visibility_threshold
+                    and nodes[23].visibility >= args.visibility_threshold
+                    and nodes[24].visibility >= args.visibility_threshold
+                    and nodes[15].visibility >= args.visibility_threshold
+                    and nodes[16].visibility >= args.visibility_threshold
+                ):
+                    mw_x = (nodes[15].x_px + nodes[16].x_px) / 2.0
+                    mw_y = (nodes[15].y_px + nodes[16].y_px) / 2.0
+                    sm = (
+                        (nodes[11].x_px + nodes[12].x_px) / 2.0,
+                        (nodes[11].y_px + nodes[12].y_px) / 2.0,
+                    )
+                    wm = (mw_x, mw_y)
+                    hp_deg = hand_plane_angle_2d_abs_deg(sm, wm)
+                    if np.isnan(hp_deg):
+                        hp_deg = float("nan")
+                mid_wrist_x_series.append(mw_x)
+                mid_wrist_y_series.append(mw_y)
+                hand_plane_deg_series.append(hp_deg)
+
+            else:
+                mid_wrist_x_series.append(float("nan"))
+                mid_wrist_y_series.append(float("nan"))
+                hand_plane_deg_series.append(float("nan"))
+
             # Always write one row per frame for angles CSV.
             writer_angles.writerow(
                 [
@@ -779,6 +971,48 @@ def main():
                 w.writerow(
                     [ev.phase, ev.start_frame, f"{ev.start_timestamp_sec:.6f}", ev.end_frame]
                 )
+
+    if not args.no_swing_features:
+        mw_x_arr = np.asarray(mid_wrist_x_series, dtype=np.float64)
+        mw_y_arr = np.asarray(mid_wrist_y_series, dtype=np.float64)
+        hp_arr = np.asarray(hand_plane_deg_series, dtype=np.float64)
+        n_frames = len(mid_wrist_x_series)
+        feats = compute_swing_features(
+            mid_wrist_x=mw_x_arr,
+            mid_wrist_y=mw_y_arr,
+            hand_plane_deg=hp_arr,
+            fps=float(fps),
+            ema_alpha=float(args.ema_alpha),
+            events=events,
+            frame_count=n_frames,
+        )
+        feature_columns = [
+            "frame_count",
+            "wrist_speed_proxy_peak_impact_px_s",
+            "wrist_speed_proxy_mean_impact_px_s",
+            "wrist_lateral_displacement_address_to_impact_px",
+            "wrist_lateral_mean_vx_impact_px_s",
+            "hand_plane_angle_mean_address_deg",
+            "hand_plane_angle_mean_top_deg",
+            "hand_plane_angle_mean_impact_deg",
+            "duration_takeaway_sec",
+            "duration_top_sec",
+            "duration_top_to_impact_sec",
+            "duration_impact_sec",
+            "backswing_to_downswing_ratio",
+        ]
+
+        def fmt_feature_cell(v: float) -> str:
+            if v is None or (isinstance(v, float) and not np.isfinite(v)):
+                return ""
+            return f"{float(v):.6f}"
+
+        with open(swing_features_csv_path, "w", newline="", encoding="utf-8") as f_feat:
+            wf = csv.writer(f_feat)
+            wf.writerow(feature_columns)
+            wf.writerow([fmt_feature_cell(feats[k]) for k in feature_columns])
+
+        print(f"Wrote swing features CSV: {swing_features_csv_path}")
 
     print(f"Wrote CSV: {csv_path}")
     print(f"Wrote CSV: {angles_csv_path}")
